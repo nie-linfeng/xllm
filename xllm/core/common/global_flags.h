@@ -381,6 +381,8 @@ DECLARE_bool(enable_split_rmsnorm_rope);
 DECLARE_bool(enable_aclnn_matmul);
 
 DECLARE_bool(enable_aclnn_swiglu);
+
+DECLARE_bool(enable_flash_comm);
 #endif
 
 // --- chat template config ---

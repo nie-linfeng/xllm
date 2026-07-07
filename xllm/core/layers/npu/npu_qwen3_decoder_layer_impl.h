@@ -34,14 +34,45 @@ limitations under the License.
 #include "loader/qwen3_decoder_loader.h"
 #include "nlohmann/json.hpp"
 #include "npu_base_layer.h"
+#include "operations/fusion/attention/fusion_attention.h"
 #include "pytorch/adapter/utils/utils.h"
 #include "xllm_atb_layers/core/include/atb_speed/base/hosttensor_binder.h"
 #include "xllm_atb_layers/core/include/atb_speed/base/model.h"
 #include "xllm_atb_layers/core/include/atb_speed/log.h"
 #include "xllm_atb_layers/core/include/atb_speed/utils/model_factory.h"
 #include "xllm_atb_layers/models/qwen3/layer/decoder_layer.h"
+
 namespace xllm {
 namespace layer {
+
+// Subclass that adds FlashComm1.0 tensor registration without modifying
+// atb_layers.
+class FlashCommQwenDecoderLayer : public atb_speed::qwen::QwenDecoderLayer {
+ public:
+  using atb_speed::qwen::QwenDecoderLayer::QwenDecoderLayer;
+
+ protected:
+  void ConstructInTensorMap() override {
+    QwenDecoderLayer::ConstructInTensorMap();
+    if (this->param.enableFlashComm)
+      atb_speed::common::AddTensorToList(
+          this->inTensorCandidates, "flash_comm", this->inTensorList);
+  }
+  std::map<unsigned int, std::vector<std::string>> GetAttentionIntensor()
+      override {
+    auto m = QwenDecoderLayer::GetAttentionIntensor();
+    if (this->param.enableFlashComm)
+      m[atb_speed::common::AttnInTensorCategory::ATTN_FC] = {"send_counts",
+                                                             "sdispls",
+                                                             "send_count",
+                                                             "recv_counts",
+                                                             "rdispls",
+                                                             "recv_count",
+                                                             "fake_rs_shape",
+                                                             "fake_ag_shape"};
+    return m;
+  }
+};
 
 class NpuQwen3DecoderLayerImpl : public BaseLayer {
  public:
@@ -95,6 +126,11 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
 
   int64_t init_attn_mask();
 
+  void prepare_flash_comm_tensors(int64_t per_rank,
+                                  int64_t hidden,
+                                  int32_t ws,
+                                  torch::Device dev);
+
   atb_speed::Model::Node prefill_node_;
   atb_speed::Model::Node decode_graph_node_;
   atb_speed::Model::Node decode_eager_node_;
@@ -105,6 +141,15 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
   atb::Tensor internal_tensors_;
   atb::Tensor residual_tensors_;
   atb::Tensor placeholder_;
+
+  // FlashComm1.0 tensor storage + host-side data
+  atb::Tensor flash_send_counts_, flash_sdispls_, flash_send_count_;
+  atb::Tensor flash_recv_counts_, flash_rdispls_, flash_recv_count_;
+  atb::Tensor flash_fake_rs_shape_, flash_fake_ag_shape_;
+  std::vector<int64_t> flash_send_counts_host_, flash_sdispls_host_,
+      flash_send_count_host_ = {0};
+  std::vector<int64_t> flash_recv_counts_host_, flash_rdispls_host_,
+      flash_recv_count_host_ = {0};
 
   at::Tensor decode_attn_mask_;
 

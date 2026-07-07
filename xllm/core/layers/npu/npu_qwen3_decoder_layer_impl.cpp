@@ -131,6 +131,9 @@ void NpuQwen3DecoderLayerImpl::param_from_args(
   if (kernel_config.enable_split_rmsnorm_rope()) {
     param.enableSplitRmsNormRope = true;
   }
+  if (isPrefill && kernel_config.enable_flash_comm()) {
+    param.enableFlashComm = true;
+  }
 }
 
 void NpuQwen3DecoderLayerImpl::initialize_parallel_parameters(
@@ -257,7 +260,7 @@ int64_t NpuQwen3DecoderLayerImpl::init_node(
     atb_speed::Model::Node& node,
     atb_speed::qwen::QwenLayerParam& param) {
   atb::Operation* operation = nullptr;
-  atb_speed::qwen::QwenDecoderLayer decoder_layer(param);
+  FlashCommQwenDecoderLayer decoder_layer(param);
   decoder_layer.BuildGraph(&operation);
   node.operation.reset(operation);
   CHECK_NOTNULL(node.operation);
@@ -414,6 +417,22 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.inTensors.at(input_idx++) = residual_tensors_;
   }
 
+  // FlashComm1.0: attach auxiliary tensors (prefill only)
+  if (is_prefill && prefill_param_.enableFlashComm) {
+    prepare_flash_comm_tensors(x.size(0),
+                               x.size(1),
+                               prefill_param_.tensorParallelInfo.worldSize,
+                               x.device());
+    node.variantPack.inTensors.at(input_idx++) = flash_send_counts_;
+    node.variantPack.inTensors.at(input_idx++) = flash_sdispls_;
+    node.variantPack.inTensors.at(input_idx++) = flash_send_count_;
+    node.variantPack.inTensors.at(input_idx++) = flash_recv_counts_;
+    node.variantPack.inTensors.at(input_idx++) = flash_rdispls_;
+    node.variantPack.inTensors.at(input_idx++) = flash_recv_count_;
+    node.variantPack.inTensors.at(input_idx++) = flash_fake_rs_shape_;
+    node.variantPack.inTensors.at(input_idx++) = flash_fake_ag_shape_;
+  }
+
   if (!is_prefill && use_graph_decode_input &&
       input_params.graph.tiling_data.defined()) {
     node.variantPack.inTensors.at(input_idx++) =
@@ -431,6 +450,40 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
       (node_id < num_hidden_layers_ - 1) && residual_.defined()) {
     node.variantPack.outTensors.at(1) = residual_tensors_;
   }
+}
+
+void NpuQwen3DecoderLayerImpl::prepare_flash_comm_tensors(int64_t per_rank,
+                                                          int64_t hidden,
+                                                          int32_t ws,
+                                                          torch::Device dev) {
+  int64_t elems = per_rank * hidden;
+  flash_send_counts_host_.assign(ws, elems);
+  flash_sdispls_host_.resize(ws);
+  for (int i = 0; i < ws; ++i) flash_sdispls_host_[i] = i * elems;
+  flash_recv_counts_host_ = flash_send_counts_host_;
+  flash_rdispls_host_ = flash_sdispls_host_;
+  flash_send_count_host_ = {elems};
+  flash_recv_count_host_ = {elems};
+
+  auto i64 = torch::TensorOptions().dtype(torch::kInt64).device(dev);
+  auto f16 = torch::TensorOptions().dtype(torch::kFloat16).device(dev);
+  // atb_layers reads values from hostData; device data need not be initialized.
+  auto mk = [&](std::vector<int64_t>& h) {
+    auto t = atb_speed::Utils::AtTensor2Tensor(
+        torch::empty({(int64_t)h.size()}, i64));
+    t.hostData = h.data();
+    return t;
+  };
+  flash_send_counts_ = mk(flash_send_counts_host_);
+  flash_sdispls_ = mk(flash_sdispls_host_);
+  flash_send_count_ = mk(flash_send_count_host_);
+  flash_recv_counts_ = mk(flash_recv_counts_host_);
+  flash_rdispls_ = mk(flash_rdispls_host_);
+  flash_recv_count_ = mk(flash_recv_count_host_);
+  flash_fake_rs_shape_ =
+      atb_speed::Utils::AtTensor2Tensor(torch::empty({per_rank}, f16));
+  flash_fake_ag_shape_ =
+      atb_speed::Utils::AtTensor2Tensor(torch::empty({per_rank * ws}, f16));
 }
 
 }  // namespace layer

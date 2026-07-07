@@ -51,6 +51,9 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
     auto dp_local_tp_size =
         parallel_args.world_size() / parallel_args.dp_size();
     dp_rank_ = parallel_args.rank() / dp_local_tp_size;
+    tp_rank_ = parallel_args.rank() % dp_local_tp_size;
+    tp_world_size_ = dp_local_tp_size;
+    mapping_ = parallel_args.mapping();
 
     blocks_ = register_module("layers", torch::nn::ModuleList());
     layers_.reserve(model_args.n_layers());
@@ -223,6 +226,51 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
         const_cast<ModelInputParams&>(input_params);
     const int64_t num_tokens = h.size(0);
     const int64_t hidden_size = h.size(-1);
+
+    bool flash_comm_enabled =
+        ::xllm::KernelConfig::get_instance().enable_flash_comm() &&
+        !input_params.meta.batch_forward_type.is_decode();
+    int64_t flash_pad_size = 0;
+    if (flash_comm_enabled) {
+      flash_pad_size =
+          (tp_world_size_ - num_tokens % tp_world_size_) % tp_world_size_;
+      if (flash_pad_size > 0) {
+        auto pad_seq = [&](torch::Tensor& t) {
+          auto s = t.sizes().vec();
+          s[0] = flash_pad_size;
+          t = torch::cat({t, torch::zeros(s, t.options())}, 0);
+        };
+        h = torch::cat(
+            {h, torch::zeros({flash_pad_size, hidden_size}, h.options())}, 0);
+        pad_seq(cos_pos);
+        pad_seq(sin_pos);
+        int64_t padded = num_tokens + flash_pad_size;
+        if (!::xllm::SchedulerConfig::get_instance().enable_chunked_prefill() &&
+            padded > 128)
+          attn_mask = attn_mask_.get_attn_mask(
+              padded, cos_pos.dtype().toScalarType(), cos_pos.device());
+        auto& slots = input_params_new.attention.device.new_cache_slots;
+        if (slots.defined() && slots.size(0) == num_tokens)
+          slots = torch::cat(
+              {slots, torch::full({flash_pad_size}, -1, slots.options())}, 0);
+        if (::xllm::KernelConfig::get_instance().enable_interlayer_addnorm() &&
+            residual.defined()) {
+          residual = torch::cat(
+              {residual,
+               torch::zeros({flash_pad_size, hidden_size}, residual.options())},
+              0);
+          set_residual(residual);
+        }
+      }
+      int64_t per_rank = h.size(0) / tp_world_size_;
+      h = h.narrow(0, tp_rank_ * per_rank, per_rank).contiguous();
+      if (residual.defined()) {
+        residual =
+            residual.narrow(0, tp_rank_ * per_rank, per_rank).contiguous();
+        set_residual(residual);
+      }
+    }
+
     int64_t capture_idx = 0;
     RollingLayerGuard rolling_guard(rolling_mgr_);
     for (size_t i = 0; i < layers_.size(); i++) {
@@ -267,11 +315,43 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
       rolling_guard.after_layer(layer_index);
       if (use_deepstack) {
         if (deep_stacks.size() > 0 && i < deep_stacks.size()) {
-          h = h + deep_stacks[i];
+          if (flash_comm_enabled) {
+            // deep_stacks are full [seq_len, hidden], split to match h
+            // [seq_len/tp, hidden]
+            int64_t per_rank = h.size(0);
+            h = h + deep_stacks[i].narrow(0, tp_rank_ * per_rank, per_rank);
+          } else {
+            h = h + deep_stacks[i];
+          }
         }
       }
     }
+
+    // FlashComm1.0: AllGather to restore full sequence length before final norm
+    if (flash_comm_enabled) {
+      HcclComm hcclComm = nullptr;
+      std::string domain;
+      mapping_.Get(atb_speed::base::ATTN_TP).InitCommDomain(hcclComm, domain);
+      auto out =
+          torch::empty({tp_world_size_ * h.size(0), h.size(1)}, h.options());
+      HcclDataType dt = h.scalar_type() == torch::kBFloat16
+                            ? HCCL_DATA_TYPE_BFP16
+                            : HCCL_DATA_TYPE_FP16;
+      HcclResult ret = HcclAllGather(h.data_ptr(),
+                                     out.data_ptr(),
+                                     h.size(0) * h.size(1),
+                                     dt,
+                                     hcclComm,
+                                     c10_npu::getCurrentNPUStream().stream());
+      if (ret != HCCL_SUCCESS)
+        LOG(FATAL) << "HcclAllGather failed, ret=" << ret;
+      h = out;
+    }
+
     auto hidden_states = norm_(h, 0);
+    if (flash_comm_enabled && flash_pad_size > 0)
+      hidden_states = hidden_states.narrow(0, 0, num_tokens).contiguous();
+
     if (capture_aux_hidden_states_) {
       torch::Tensor aux_hidden_states =
           aux_output_buffer_.slice(0, 0, num_tokens);
@@ -285,6 +365,10 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
   std::unordered_set<int32_t> layers_to_capture_set_;
   bool capture_aux_hidden_states_ = false;
   torch::Tensor aux_output_buffer_;
+  // FlashComm1.0: TP rank/world_size and process group for split/allgather
+  int32_t tp_rank_ = 0;
+  int32_t tp_world_size_ = 1;
+  atb_speed::base::Mapping mapping_;
 };
 TORCH_MODULE(QWen3Model);
 
