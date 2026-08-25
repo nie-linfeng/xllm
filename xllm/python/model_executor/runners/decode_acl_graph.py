@@ -519,158 +519,6 @@ class DecodeAclGraphRunner(BaseRunner):
 
     def warmup(
         self,
-        device: torch.device,
-        _dtype: torch.dtype,
-        input_embedding: torch.Tensor | None = None,
-    ) -> None:
-        if self._warmed_up:
-            return
-        self._warmed_up = True
-
-        # MLA/SFA graph inputs include Lightning Indexer state and paged KV
-        # metadata.  Capturing these graphs with dummy warmup data would make
-        # the first real replay consume stale indexer/KV arguments.  Let the
-        # first real request lazily capture its bucket instead.
-        if getattr(self.attention_backend, "is_mla", False):
-            return
-
-        # TODO: Warmup capture with dummy data causes garbled
-        # output on the first real request for dense FIA models.  The root
-        # cause is likely related to 529d0b21's kv_cu_seq_lens cumulative
-        # format change interacting with the kv_seq_lens_delta tensor that is
-        # now aliased to static_metadata.kv_seq_lens during capture.  Disable
-        # warmup for now and let the first real decode lazily capture its
-        # graph bucket.  This trades slightly higher first-token latency for
-        # correctness.
-        return
-
-        buckets = [size for size in (1, 2, 4, 8) if size <= self.max_batch]
-        buckets.extend(range(16, self.max_batch + 1, 16))
-        page_size = self.attention_backend.page_size
-        for batch_size in buckets:
-            slot_base = torch.arange(batch_size, dtype=torch.int32, device=device).mul_(page_size)
-            block_ids = torch.arange(batch_size, dtype=torch.int32, device=device)
-            metadata = _StaticAttentionMetadata(
-                slot_mapping=slot_base,
-                paged_kv_indptr=torch.arange(batch_size + 1, dtype=torch.int32, device=device),
-                paged_kv_indices=block_ids,
-                paged_kv_last_page_len=torch.ones(batch_size, dtype=torch.int32, device=device),
-                kv_seq_lens_host=torch.full((batch_size,), 2, dtype=torch.int32, device="cpu"),
-                kv_seq_lens_host_values=[2] * batch_size,
-                # _decode_metadata (added by the expanded-decode path) reads the
-                # device kv_seq_lens directly; the warmup must provide one so the
-                # graph captures. The value is a dummy -- at replay the real
-                # metadata's kv_seq_lens is copied over the static buffer.
-                kv_seq_lens=torch.full((batch_size,), 2, dtype=torch.int32, device=device),
-                kv_cu_seq_lens=torch.arange(batch_size + 1, dtype=torch.int32, device=device).mul_(2),
-                block_table=block_ids.unsqueeze(1),
-            )
-            warmup_embedding = None
-            if input_embedding is not None:
-                warmup_embedding = torch.zeros(
-                    batch_size,
-                    input_embedding.shape[-1],
-                    dtype=input_embedding.dtype,
-                    device=device,
-                )
-            self.execute(
-                torch.zeros(batch_size, dtype=torch.int32, device=device),
-                torch.zeros(batch_size, dtype=torch.int32, device=device),
-                metadata,
-                warmup_embedding,
-            )
-        if paged_kv_indices.dim() != 1 or paged_kv_indices.numel() == 0:
-            raise RuntimeError("decode paged_kv_indices must be a non-empty flat page list")
-
-    @staticmethod
-    def _validate_decode_token_layout(
-        input_ids: torch.Tensor,
-        positions: torch.Tensor | None,
-        slot_mapping: torch.Tensor,
-        metadata_row_count: int,
-    ) -> None:
-        if input_ids.dim() != 1 or input_ids.numel() != metadata_row_count:
-            raise RuntimeError("ACL graph decode input_ids must contain one token per metadata row")
-        if slot_mapping.dim() != 1 or slot_mapping.numel() != metadata_row_count:
-            raise RuntimeError("ACL graph decode slot_mapping must contain one slot per token")
-        if positions is not None and (positions.dim() != 1 or positions.numel() != metadata_row_count):
-            raise RuntimeError("ACL graph decode positions must contain one value per token")
-
-    def _has_compatible_decode_metadata(
-        self,
-        input_ids: torch.Tensor,
-        metadata: AttentionMetadata,
-    ) -> bool:
-        """Check that token tensors and decode metadata use the same row layout."""
-        (
-            block_table,
-            _,
-            _,
-            _,
-            _,
-            _,
-        ) = self._decode_metadata(metadata)
-        self._validate_decode_token_layout(
-            input_ids,
-            None,
-            metadata.slot_mapping,
-            block_table.shape[0],
-        )
-        batch_size = input_ids.numel()
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
-        if not is_expanded and metadata.kv_cu_seq_lens is not None:
-            if metadata.kv_cu_seq_lens.numel() not in (
-                batch_size,
-                batch_size + 1,
-            ):
-                return False
-        if metadata.q_cu_seq_lens is not None and not is_expanded:
-            if metadata.q_cu_seq_lens.numel() not in (
-                batch_size,
-                batch_size + 1,
-            ):
-                return False
-        return True
-
-    @staticmethod
-    def _cumulative_lengths(
-        sequence_lengths: torch.Tensor,
-        cumulative_lengths: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Normalize NPU sequence ends to a cumulative tensor with a zero."""
-        batch_size = sequence_lengths.numel()
-        if cumulative_lengths is None:
-            return torch.cat(
-                (
-                    torch.zeros(
-                        1,
-                        dtype=torch.int32,
-                        device=sequence_lengths.device,
-                    ),
-                    torch.cumsum(sequence_lengths, dim=0),
-                )
-            )
-        cumulative_lengths = cumulative_lengths.to(torch.int32)
-        if cumulative_lengths.numel() == batch_size + 1:
-            return cumulative_lengths
-        if cumulative_lengths.numel() == batch_size:
-            return torch.cat(
-                (
-                    torch.zeros(
-                        1,
-                        dtype=torch.int32,
-                        device=cumulative_lengths.device,
-                    ),
-                    cumulative_lengths,
-                )
-            )
-        raise RuntimeError(
-            "cumulative sequence lengths must contain either one value per "
-            "sequence or a leading zero plus one value per sequence"
-        )
-
-    def warmup(
-        self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
@@ -681,21 +529,12 @@ class DecodeAclGraphRunner(BaseRunner):
         if padded_batch_size > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
 
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
-        graph_key = self._graph_key(
-            padded_batch_size,
-            is_expanded,
-            input_embedding,
-        )
-        if graph_key in self._graphs:
-            return
-
-        self._prepare_graph_entry(
-            input_ids,
-            positions,
-            metadata,
-            input_embedding,
-        )
+        # Graph capture is performed lazily by ``execute`` on the first decode
+        # of each (bucket, expanded, embedding) key -- including the synthetic
+        # batches driven by the C++ graph-warmup phase -- so this entry point
+        # only validates capacity.  Pre-capturing here would duplicate
+        # ``execute``'s first-capture path; deferring keeps a single capture
+        # code path and matches the lazy-capture V3 wiring.
 
     def execute(
         self,

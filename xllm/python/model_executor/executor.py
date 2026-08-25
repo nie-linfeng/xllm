@@ -190,7 +190,7 @@ class ModelExecutor:
                 execution_model,
                 self.attention_backend,
                 device,
-                max_graph_tokens,
+                max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
                 dp_size,
                 dp_rank,
@@ -258,7 +258,12 @@ class ModelExecutor:
             and not self._lazy_capture_blocked()
             and graph_runner.can_execute(input_ids, metadata, input_embedding)
         ):
-            graph_runner.warmup(input_ids.device, input_ids.dtype, input_embedding)
+            graph_runner.warmup(
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+            )
             return graph_runner.execute(input_ids, positions, metadata, input_embedding)
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(

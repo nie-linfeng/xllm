@@ -46,6 +46,14 @@ class VLMEngine : public Engine {
 
   const runtime::Options& options() const { return options_; }
 
+  // VLMEngine is the target engine under MTP speculation (backend=vlm). Without
+  // this override the Engine base returns an empty shape (num_speculative_tokens
+  // = 0), so the decode graph warmup skips the MTP bootstrap injection and the
+  // synthetic decode state validation fails. Mirror LLMEngine so the warmup plan
+  // carries the real speculative/decoding token counts.
+  runtime::DecodeGraphExecutionShape decode_graph_execution_shape()
+      const override;
+
   bool init() override;
 
   void update_last_step_result(std::vector<Batch>& batch) override;

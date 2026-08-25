@@ -9,7 +9,7 @@ export PYTHON_LIB_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_conf
 export PYTORCH_NPU_INSTALL_PATH=/usr/local/libtorch_npu/
 export PYTORCH_INSTALL_PATH="$(python3 -c 'import torch, os; print(os.path.dirname(os.path.abspath(torch.__file__)))')"
 export LIBTORCH_ROOT="$PYTORCH_INSTALL_PATH"
-export LD_LIBRARY_PATH=/usr/local/libtorch_npu/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu/lib:/usr/local/libtorch_npu/lib:$LD_LIBRARY_PATH
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export PROFILING_MODE=dynamic
 source /usr/local/Ascend/ascend-toolkit/set_env.sh

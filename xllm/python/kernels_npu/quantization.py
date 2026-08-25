@@ -46,6 +46,11 @@ def quant_matmul(
         The product with shape ``[..., N]`` in ``output_dtype``.
     """
     if not transpose2:
+        # torch_npu 2.9's aclnnQuantMatmulWeightNz requires a 1-D
+        # pertokenScale, but ATB's dynamic_quant op returns ``[1, N]``; flatten
+        # to one element per row of ``x1`` (order is preserved row-major).
+        if pertoken_scale is not None and pertoken_scale.dim() != 1:
+            pertoken_scale = pertoken_scale.reshape(-1)
         return torch_npu.npu_quant_matmul(
             x1,
             x2,

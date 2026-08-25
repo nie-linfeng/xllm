@@ -315,12 +315,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
         else:
             self._actual_seq_lens = None
 
-        if self._block_table_i32 is not None and not self._is_mla:
-            if kv_seq_lens_host_values is None:
-                raise RuntimeError("decode attention requires scheduler-provided host KV lengths")
-            if len(kv_seq_lens_host_values) != real_batch:
-                if len(kv_seq_lens_host_values) > real_batch:
-                    kv_seq_lens_host_values = kv_seq_lens_host_values[:real_batch]
+        if metadata.block_table is not None:
+            self._block_table_i32 = metadata.block_table.to(torch.int32)
+
+            real_batch = metadata.block_table.shape[0]
+
+            kv_host = metadata.kv_seq_lens_host
+            if kv_host is not None:
+                kv_host = kv_host.cpu()
+                if kv_host.numel() == real_batch + 1:
+                    per_seq_kv = kv_host[1:] - kv_host[:-1]
                 else:
                     per_seq_kv = kv_host
             else:
@@ -331,6 +335,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
             self._actual_seq_q = list(range(1, real_batch + 1))
             self._actual_seq_kv = kv_list
         else:
+            self._block_table_i32 = None
             self._actual_seq_q = []
             self._actual_seq_kv = []
 
