@@ -123,11 +123,23 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._weight_is_transposed:
+            # NZ-fractal matmul path: bias added separately after the (optional)
+            # all-reduce (matmul has no fused-bias variant).
             out = torch.matmul(x, self.weight)
-        else:
+            if self.tp_size > 1 and self.reduce_results:
+                distributed.all_reduce_(out)
+            if self.bias is not None:
+                out = out + self.bias
+        elif self.tp_size > 1 and self.reduce_results:
+            # TP>1: partial output, all-reduce, then add the replicated bias
+            # exactly once (mirrors the original contract).
             out = torch.nn.functional.linear(x, self.weight)
-        if self.tp_size > 1 and self.reduce_results:
             distributed.all_reduce_(out)
-        if self.bias is not None:
-            out = out + self.bias
+            if self.bias is not None:
+                out = out + self.bias
+        else:
+            # TP1: fuse bias into F.linear — one kernel, matches transformers
+            # ``nn.Linear`` / ``ColumnParallelLinear``; avoids the bf16 ULP of
+            # a separate ``out += bias`` add.
+            out = torch.nn.functional.linear(x, self.weight, self.bias)
         return out

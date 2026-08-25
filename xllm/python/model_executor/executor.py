@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -102,21 +104,44 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        # Diagnostic (XLLM_ACL_GRAPH_LAZY_CAPTURE=1): hold the decode graph
+        # runner back until the engine starts serving real requests (the C++
+        # graph warmup's synthetic decode steps then fall back to eager), so
+        # the first REAL decode lazily captures its bucket with real metadata
+        # — its capture-warmup forwards are then dumpable/comparable. The
+        # warmup runs exactly one prefill before its decode steps, so the
+        # second prefill marks the first real request.
+        self._lazy_graph_capture = os.environ.get("XLLM_ACL_GRAPH_LAZY_CAPTURE") == "1"
+        self._prefill_count = 0
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
         if not attention_layers:
             raise ValueError("Python model does not contain an Attention layer")
 
-        first_attention = attention_layers[0]
-        expected_config = self._attention_config(first_attention)
-        for layer in attention_layers[1:]:
-            if self._attention_config(layer) != expected_config:
-                raise ValueError("Attention backend requires identical attention configuration across all layers")
+        # GLM-Next mixes DSA (MLA) and KDA (linear-attention) layers with
+        # different head/dim configs; the paged backend only serves the DSA
+        # layers, so it is built from the first DSA layer and the "identical
+        # config across all layers" check is skipped. Non-GLM-Next models keep
+        # the upstream behavior: backend from the first layer plus the
+        # identical-config check.
+        from xllm.python.models.glm5_next import Glm5NextMlaAttention
+        dsa_layers = [
+            layer for layer in attention_layers
+            if isinstance(layer, Glm5NextMlaAttention)
+        ]
+        if dsa_layers:
+            first_attention = dsa_layers[0]
+        else:
+            first_attention = attention_layers[0]
+            expected_config = self._attention_config(first_attention)
+            for layer in attention_layers[1:]:
+                if self._attention_config(layer) != expected_config:
+                    raise ValueError("Attention backend requires identical attention configuration across all layers")
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
-        self.attention_backend = _create_attention_backend(first_attention, device, first_parameter.dtype, config)
+        self.attention_backend = _create_attention_backend(first_attention, device, first_parameter.dtype)
 
         execution_model = model.model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
@@ -161,17 +186,6 @@ class ModelExecutor:
                 DecodeAclGraphRunner,
             )
 
-            num_decoding_tokens = max(1, int(num_decoding_tokens))
-            decode_batch_size_limit = (
-                None if acl_graph_decode_batch_size_limit is None else max(1, int(acl_graph_decode_batch_size_limit))
-            )
-            graph_sequence_capacity = max_seqs_per_batch
-            if decode_batch_size_limit is not None:
-                graph_sequence_capacity = min(
-                    graph_sequence_capacity,
-                    decode_batch_size_limit,
-                )
-            max_graph_tokens = graph_sequence_capacity * num_decoding_tokens
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
@@ -180,8 +194,6 @@ class ModelExecutor:
                 int(config["max_position_embeddings"]),
                 dp_size,
                 dp_rank,
-                decode_batch_size_limit,
-                num_decoding_tokens,
             )
         else:
             if self.eager_runner.cp_size > 1:
@@ -223,6 +235,9 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         self._kv_bound = True
 
+    def _lazy_capture_blocked(self) -> bool:
+        return self._lazy_graph_capture and self._prefill_count < 2
+
     @torch.inference_mode()
     def execute(
         self,
@@ -235,14 +250,15 @@ class ModelExecutor:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
 
+        if metadata.is_prefill or metadata.is_chunked_prefill:
+            self._prefill_count += 1
         graph_runner = self.decode_graph_runner
-        if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding):
-            graph_runner.warmup(
-                input_ids,
-                positions,
-                metadata,
-                input_embedding,
-            )
+        if (
+            graph_runner is not None
+            and not self._lazy_capture_blocked()
+            and graph_runner.can_execute(input_ids, metadata, input_embedding)
+        ):
+            graph_runner.warmup(input_ids.device, input_ids.dtype, input_embedding)
             return graph_runner.execute(input_ids, positions, metadata, input_embedding)
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(

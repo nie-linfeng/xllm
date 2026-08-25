@@ -1225,7 +1225,7 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
 TEST(AclGraphPersistentParamTest,
      GenericSpecVerifyCaptureKeepsPersistentBlockTableWidth) {
   constexpr int32_t kSpecWidth = 6;
-  constexpr int64_t kActiveBlockTableWidth = 2;
+  constexpr int64_t kActiveBlockTableWidth = 5;
   ModelArgs args;
   args.model_type("deepseek_v4");
   args.dtype("float32");
@@ -1297,53 +1297,6 @@ TEST(AclGraphPersistentParamTest,
   EXPECT_EQ(stable->graph.expanded_block_tables.size(0), kSpecWidth);
   EXPECT_EQ(stable->graph.expanded_block_tables.size(1),
             kActiveBlockTableWidth);
-}
-
-TEST(AclGraphPersistentParamTest, AuxHiddenStatesUseGraphTokenCapacity) {
-  SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();
-  const bool original_enable_atb_spec_kernel =
-      speculative_config.enable_atb_spec_kernel();
-  speculative_config.enable_atb_spec_kernel(false);
-
-  ModelArgs args;
-  args.model_type("deepseek_v4");
-  args.dtype("float32");
-  args.hidden_size(8);
-  args.max_position_embeddings(32);
-
-  runtime::Options options;
-  options.block_size(4);
-  options.max_seqs_per_batch(10);
-  options.max_tokens_per_batch(64);
-  options.num_decoding_tokens(3);
-  options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
-
-  const torch::Device device("npu:0");
-  const torch::TensorOptions tensor_options =
-      torch::dtype(torch::kFloat32).device(device);
-  const torch::Tensor aux_hidden_states = torch::ones({12, 16}, tensor_options);
-
-  ::xllm::npu::GraphPersistentParam target_param(args, device, options);
-  target_param.set_aux_hidden_states(aux_hidden_states);
-  const int64_t expected_target_capacity =
-      runtime::get_decode_graph_token_bucket(
-          static_cast<int64_t>(options.max_seqs_per_batch()) *
-              options.num_decoding_tokens(),
-          options.enable_graph_mode_decode_no_padding());
-  EXPECT_EQ(target_param.aux_hidden_states().size(0), expected_target_capacity);
-
-  options.is_draft_engine(true);
-  ::xllm::npu::GraphPersistentParam draft_param(args, device, options);
-  draft_param.set_aux_hidden_states(aux_hidden_states.slice(
-      /*dim=*/0, /*start=*/0, /*end=*/options.max_seqs_per_batch()));
-  const int64_t expected_draft_capacity =
-      runtime::get_decode_graph_token_bucket(
-          options.max_seqs_per_batch(),
-          options.enable_graph_mode_decode_no_padding());
-  EXPECT_EQ(draft_param.aux_hidden_states().size(0), expected_draft_capacity);
-
-  speculative_config.enable_atb_spec_kernel(original_enable_atb_spec_kernel);
 }
 
 TEST(SpeculativeConfigTest, MtpAlgorithmClassificationIsCaseInsensitive) {

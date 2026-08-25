@@ -17,6 +17,43 @@ from typing import Any
 from ....common.manifest import KernelAbi, KernelVariantManifest
 from ....common.spec import DispatchField
 
+DEFAULT_ASCEND_PASS_CONFIGS = {
+    # Use raw pass-config strings to avoid hard dependency on
+    # tilelang.PassConfigKey export timing/version.
+    "tl.ascend_auto_sync": True,
+    "tl.ascend_memory_planning": True,
+    "tl.ascend_auto_cross_core_sync": True,
+    "tl.ascend_auto_cv_combine": True,
+}
+
+DEFAULT_ASCEND_BISHENG_ARCH = "dav-2201"
+ASCEND_VEC_CORE_NUM_PROPERTY_KEYS = (
+    "vector_core_num",
+    "aiv_core_num",
+    "vec_core_num",
+)
+
+# This is the single source of truth for the generated speculative-verification
+# registries. Verification width includes the base target token, so these
+# variants cover MTP depths 1, 3, 4, and 5.
+SUPPORTED_SPEC_VERIFY_WIDTHS = (2, 4, 5, 6)
+
+
+def detect_vec_core_num(default_vec_core_num: int = 48) -> int:
+    try:
+        import torch
+
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            props = torch.npu.get_device_properties(torch.npu.current_device())
+            for key in ASCEND_VEC_CORE_NUM_PROPERTY_KEYS:
+                value = getattr(props, key, None)
+                if isinstance(value, int) and value > 0:
+                    return value
+    except Exception:
+        pass
+
+    return default_vec_core_num
+
 
 def _snake_to_pascal(name: str) -> str:
     parts = [part for part in name.split("_") if part]

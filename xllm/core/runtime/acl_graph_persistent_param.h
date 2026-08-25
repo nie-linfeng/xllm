@@ -158,18 +158,6 @@ class GraphPersistentParam final {
                                             const torch::Tensor& k_cache,
                                             const torch::Tensor& v_cache,
                                             const ModelInputParams& params);
-  torch::Tensor hidden_states(uint32_t actual_tokens = 0) const {
-    if (actual_tokens > 0) {
-      return hidden_states_.slice(
-          /*dim=*/0, /*start=*/0, /*end=*/actual_tokens);
-    }
-    return hidden_states_;
-  }
-  void set_hidden_states(const torch::Tensor& value) {
-    const uint32_t result_tokens = value.size(0);
-    hidden_states_.slice(/*dim=*/0, /*start=*/0, /*end=*/result_tokens)
-        .copy_(value, /*non_blocking=*/true);
-  }
   torch::Tensor q_seq_lens(uint32_t actual_batch_size = 0) const {
     if (actual_batch_size > 0) {
       return q_seq_lens_.slice(
@@ -224,17 +212,6 @@ class GraphPersistentParam final {
     }
     return persistent_num_accepted_tokens_;
   }
-  torch::Tensor aux_hidden_states(uint32_t actual_tokens = 0) const {
-    if (!aux_hidden_states_.defined() || aux_hidden_states_.numel() == 0) {
-      return aux_hidden_states_;
-    }
-    if (actual_tokens > 0) {
-      return aux_hidden_states_.slice(
-          /*dim=*/0, /*start=*/0, /*end=*/actual_tokens);
-    }
-    return aux_hidden_states_;
-  }
-  void set_aux_hidden_states(const torch::Tensor& value);
 
  private:
   bool uses_paged_attention_tiling() const {
@@ -284,7 +261,6 @@ class GraphPersistentParam final {
   torch::Tensor persistent_mask_;
   torch::Tensor persistent_mask_zero_template_;
   torch::Tensor persistent_mask_fill_template_;
-  torch::Tensor hidden_states_;
 
   torch::Tensor q_seq_lens_;
   torch::Tensor kv_seq_lens_;
@@ -307,8 +283,6 @@ class GraphPersistentParam final {
 
   // for mrope (multimodal rotary position embedding)
   bool use_mrope_ = false;
-
-  torch::Tensor aux_hidden_states_;
 
   // ATB context and operation for paged attention plan
   atb::Context* context_for_plan_;

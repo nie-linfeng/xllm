@@ -39,7 +39,6 @@ def fused_add_rms_norm_dynamic_quant(
         output_mask=[True, False],
     )
     return outputs[0], outputs[3], outputs[2]
-rms_norm_dynamic_quant = torch.ops.xllm_ops.rms_norm_dynamic_quant
 
 
 def l2_norm(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -52,7 +51,10 @@ def l2_norm(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     Returns:
         A tensor with the shape and dtype of ``value``.
     """
-    return torch.ops.xllm_ops.l2_norm(value, eps)
+    del value, eps
+    raise NotImplementedError(
+        "l2_norm has no NPU kernel; see kernels_cuda/triton/l2_norm.py for the reference implementation"
+    )
 
 
 def rms_norm_gated(
@@ -72,14 +74,16 @@ def rms_norm_gated(
     Returns:
         A tensor with the shape and dtype of ``value``.
     """
-    return torch.ops.xllm_ops.rms_norm_gated(value, gate, weight, eps)
+    del value, gate, weight, eps
+    raise NotImplementedError(
+        "rms_norm_gated has no NPU kernel; see kernels_cuda/triton/rms_norm.py for the reference implementation"
+    )
 
 
 __all__ = [
     "rms_norm",
     "fused_add_rms_norm",
     "fused_add_rms_norm_dynamic_quant",
-    "rms_norm_dynamic_quant",
     "l2_norm",
     "rms_norm_gated",
 ]

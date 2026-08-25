@@ -17,9 +17,10 @@ limitations under the License.
 
 #include <Python.h>
 #include <glog/logging.h>
-#include <pybind11/pybind11.h>
+#include <pybind11/embed.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -29,13 +30,12 @@ limitations under the License.
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/runtime/py_attention_metadata.h"
-#include "models/llm/py_causal_lm.h"
-
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
+#include "models/llm/py_causal_lm.h"
 
 namespace py = pybind11;
 
@@ -44,13 +44,6 @@ namespace {
 
 py::object optional_tensor(const torch::Tensor& tensor) {
   return tensor.defined() ? py::cast(tensor) : py::none();
-}
-
-py::object optional_tensor(const std::optional<torch::Tensor>& tensor) {
-  if (!tensor.has_value() || !tensor->defined()) {
-    return py::none();
-  }
-  return py::cast(*tensor);
 }
 
 void clear_python_object(py::object& object) {
@@ -65,9 +58,10 @@ void clear_python_object(py::object& object) {
   object = py::object();
 }
 
-void register_xllm_runtime_module(py::module_& m) {
-  register_attention_metadata_views(m);
+}  // namespace
 
+PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
+  register_attention_metadata_views(m);
 #if defined(USE_NPU)
   py::class_<NPULayerSynchronizerImpl,
              std::shared_ptr<NPULayerSynchronizerImpl>>(m, "LayerSynchronizer")
@@ -112,12 +106,18 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   ensure_xllm_runtime_module();
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
-  py_executor_ = executor_module.attr("ModelExecutor")(
-      py_causal_lm_->python_model(),
-      py_causal_lm_->config_dict(),
-      options_.max_seqs_per_batch(),
-      options_.num_decoding_tokens(),
-      ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit());
+  int32_t graph_max_seqs_per_batch = options_.max_seqs_per_batch();
+#if defined(USE_NPU)
+  graph_max_seqs_per_batch = std::min(
+      graph_max_seqs_per_batch,
+      std::max<int32_t>(
+          1,
+          ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit()));
+#endif
+  py_executor_ =
+      executor_module.attr("ModelExecutor")(py_causal_lm_->python_model(),
+                                            py_causal_lm_->config_dict(),
+                                            graph_max_seqs_per_batch);
 }
 
 PyExecutorImpl::~PyExecutorImpl() { clear_python_object(py_executor_); }
@@ -151,21 +151,18 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
     py::list kv_caches_py;
     for (auto& kv : kv_caches) {
       // Slot order must match ``LayerCache`` on the Python side.
-      // Keep this order synchronized with LayerCache/_LAYER_CACHE_SLOTS.
-      // Generic caches use the first five entries; DeepSeek-V4 uses the
-      // trailing six entries returned by KVCache's DSV4 getters.
-      kv_caches_py.append(
-          py::make_tuple(optional_tensor(kv.get_k_cache()),
-                         optional_tensor(kv.get_v_cache()),
-                         optional_tensor(kv.get_index_cache()),
-                         optional_tensor(kv.get_conv_cache()),
-                         optional_tensor(kv.get_ssm_cache()),
-                         optional_tensor(kv.get_swa_cache()),
-                         optional_tensor(kv.get_compress_kv_state()),
-                         optional_tensor(kv.get_compress_score_state()),
-                         optional_tensor(kv.get_compress_index_kv_state()),
-                         optional_tensor(kv.get_compress_index_score_state()),
-                         optional_tensor(kv.get_indexer_cache_scale())));
+      const std::optional<torch::Tensor> indexer_cache_scale =
+          kv.get_indexer_cache_scale();
+      py::object indexer_cache_scale_py =
+          indexer_cache_scale.has_value()
+              ? py::cast(indexer_cache_scale.value())
+              : py::none();
+      kv_caches_py.append(py::make_tuple(optional_tensor(kv.get_k_cache()),
+                                         optional_tensor(kv.get_v_cache()),
+                                         optional_tensor(kv.get_index_cache()),
+                                         optional_tensor(kv.get_conv_cache()),
+                                         optional_tensor(kv.get_ssm_cache()),
+                                         indexer_cache_scale_py));
     }
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
     kv_bound_ = true;

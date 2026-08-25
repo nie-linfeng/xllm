@@ -44,72 +44,6 @@ def _grouped_matmul_swiglu_quant_v2(
     )
 
 
-def dequant_swiglu_quant(
-    x: torch.Tensor,
-    weight_scale: torch.Tensor | None,
-    activation_scale: torch.Tensor | None,
-    bias: torch.Tensor | None = None,
-    quant_scale: torch.Tensor | None = None,
-    quant_offset: torch.Tensor | None = None,
-    group_index: torch.Tensor | None = None,
-    activate_left: bool = True,
-    quant_mode: int = 1,
-    swiglu_mode: int = 1,
-    clamp_limit: float = 0.0,
-    glu_alpha: float = 1.0,
-    glu_bias: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the fused dequantization, SwiGLU, and dynamic quantization."""
-    return torch.ops.xllm_ops.dequant_swiglu_quant(
-        x,
-        weight_scale,
-        activation_scale,
-        bias,
-        quant_scale,
-        quant_offset,
-        group_index,
-        activate_left,
-        quant_mode,
-        swiglu_mode,
-        clamp_limit,
-        glu_alpha,
-        glu_bias,
-    )
-
-
-def moe_gating_top_k_hash(
-    x: torch.Tensor,
-    k: int,
-    bias: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
-    tid2eid: torch.Tensor | None,
-    k_group: int,
-    group_count: int,
-    routed_scaling_factor: float,
-    eps: float,
-    group_select_mode: int,
-    renorm: int,
-    norm_type: int,
-    out_flag: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select experts with the DeepSeek-V4 hash-routing gate."""
-    return torch.ops.xllm_ops.moe_gating_top_k_hash(
-        x,
-        k,
-        bias,
-        input_ids,
-        tid2eid,
-        k_group,
-        group_count,
-        routed_scaling_factor,
-        eps,
-        group_select_mode,
-        renorm,
-        norm_type,
-        out_flag,
-    )
-
-
 def supports_cutlass_moe(device: torch.device) -> bool:
     """Return whether ``device`` has the native expert GEMMs.
 
@@ -203,17 +137,23 @@ def grouped_moe(
     num_tokens = hidden_states.shape[0]
     num_experts = gating_output.shape[1]
     expert_range = active_expert_range if active_expert_range is not None else [0, num_experts]
-    sorted_hidden_i8, expanded_row_idx, group_list, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
-        hidden_states,
-        topk_ids.to(torch.int32),
-        scale=None,
-        active_num=num_tokens * topk,
-        expert_num=num_experts,
-        # GMM v2 consumes cumulative expert-token offsets.
-        expert_tokens_num_type=0,
-        expert_tokens_num_flag=True,
-        active_expert_range=expert_range,
-        quant_mode=1,
+    # W8A8 GMM v1 path (proven on real glm5_next w8a8 weights pre-graph-port).
+    # The vllm-ascend-style v2 path (expert_tokens_num_type=0 +
+    # npu_grouped_matmul_swiglu_quant_v2) diverges on these weights (L3.mlp
+    # cos 0.879 vs the pre-port engine); keep v1 until the v2 NZ contract is
+    # fixed (graph-mode Task 5).
+    sorted_hidden_i8, expanded_row_idx, expert_tokens, pertoken_scale = (
+        torch_npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids.to(torch.int32),
+            scale=None,
+            active_num=num_tokens * topk,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=expert_range,
+            quant_mode=1,
+        )
     )
     num_local_experts = expert_range[1] - expert_range[0]
     if group_list.numel() > num_local_experts:
@@ -761,7 +701,6 @@ __all__ = [
     "grouped_moe",
     "moe_gate_routing",
     "moe_expert_compute",
-    "grouped_moe_with_selected_experts",
     "moe_fused_topk",
     "cutlass_fused_moe",
     "fused_moe",

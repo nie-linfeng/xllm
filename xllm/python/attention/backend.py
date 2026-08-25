@@ -44,35 +44,11 @@ class LayerCache:
     index: torch.Tensor | None = None
     conv: torch.Tensor | None = None
     ssm: torch.Tensor | None = None
-    # DeepSeek-V4 compressed-attention cache slots. Generic models leave these
-    # as None; the tuple order is shared with PyExecutorImpl::bind_kv_caches.
-    swa: torch.Tensor | None = None
-    compress_kv_state: torch.Tensor | None = None
-    compress_score_state: torch.Tensor | None = None
-    compress_index_kv_state: torch.Tensor | None = None
-    compress_index_score_state: torch.Tensor | None = None
-    indexer_scale: torch.Tensor | None = None
-
-    @property
-    def index_scale(self) -> torch.Tensor | None:
-        """Legacy MLA alias for the shared indexer scale cache."""
-        return self.indexer_scale
+    index_scale: torch.Tensor | None = None
 
 
 #: Field order of the tuple form, which is what the C++ executor hands over.
-_LAYER_CACHE_SLOTS = (
-    "key",
-    "value",
-    "index",
-    "conv",
-    "ssm",
-    "swa",
-    "compress_kv_state",
-    "compress_score_state",
-    "compress_index_kv_state",
-    "compress_index_score_state",
-    "indexer_scale",
-)
+_LAYER_CACHE_SLOTS = ("key", "value", "index", "conv", "ssm", "index_scale")
 
 LayerCacheInput = LayerCache | tuple[torch.Tensor | None, ...]
 
@@ -121,7 +97,6 @@ class AttentionMetadata(Protocol):
     linear_state_indices: torch.Tensor | None
     has_initial_state: torch.Tensor | None
     dp_token_counts: Sequence[int]
-    dp_is_decode: Sequence[int]
     q_seq_lens: torch.Tensor | None
     expanded_decode_metadata: ExpandedDecodeMetadataLike
     is_prefill: bool
@@ -155,25 +130,6 @@ class MlaPreprocessContext:
     kv_cache: torch.Tensor
     rope_cache: torch.Tensor
     slot_mapping: torch.Tensor
-
-
-@dataclass(frozen=True)
-class CsaIndexContext:
-    """Per-forward cache and metadata view consumed by the DSV4 indexer."""
-
-    index_cache: torch.Tensor
-    indexer_scale: torch.Tensor | None
-    slot_mapping: torch.Tensor
-    block_table: torch.Tensor | None
-    cmp_block_table: torch.Tensor | None
-    kv_state: torch.Tensor | None
-    score_state: torch.Tensor | None
-    kv_block_table: torch.Tensor | None
-    score_block_table: torch.Tensor | None
-    actual_seq_q: torch.Tensor
-    actual_seq_kv: torch.Tensor
-    start_pos: torch.Tensor | None
-    qli_metadata: torch.Tensor | None
 
 
 class AttentionBackend(ABC):
@@ -236,6 +192,30 @@ class AttentionBackend(ABC):
         """Return decode cache tensors for a fused preprocessing region."""
         del layer
         return None
+
+    def execute_linear(
+        self,
+        mixed_qkv: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        layer: Attention,
+    ) -> torch.Tensor:
+        """KDA linear attention (conv1d + delta-rule) over framework state.
+
+        ``mixed_qkv`` is ``[B, 3*qkv_dim, S]`` (q/k/v concatenated, the local
+        head-subset already sharded). ``gate`` is the KDA forget gate ``g``
+        shaped ``[B, S, num_heads_local, head_dim]``; ``beta`` is
+        ``[B, S, num_heads_local]``. Returns the core attention output
+        ``[B, S, num_heads_local, head_dim]`` for the caller to gate + project.
+
+        The backend owns the per-layer conv/ssm state (the conv/ssm slots of
+        ``LayerCache``) and reads/advances/writes it via the
+        ``linear_state_indices`` / ``has_initial_state`` metadata view.
+        Backends that do not implement linear attention raise.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support linear attention (KDA)"
+        )
 
     def mla_index_context(self, layer: Attention) -> MlaIndexContext:
         """Public hook for an optional LightningIndexer.

@@ -408,16 +408,23 @@ bool AclGraph::capture(CausalLM* model,
                          kv_cache,
                          {graph_params.value()});
 
-      persistent_param_.set_hidden_states(forward_result.hidden_states);
+      // Keep graph outputs alive. Their fixed graph-pool addresses are written
+      // directly by replay, so copying them to a separate buffer is redundant.
+      graph_hidden_states_ = forward_result.hidden_states;
       if (options.enable_graph_aux_hidden_states() &&
           forward_result.aux_hidden_states.defined()) {
-        persistent_param_.set_aux_hidden_states(
-            forward_result.aux_hidden_states);
+        graph_aux_hidden_states_ = forward_result.aux_hidden_states;
+      } else {
+        graph_aux_hidden_states_ = torch::Tensor();
       }
-      graph_.capture_end();
+      // capture_end() can fail after the runtime has already left capture mode.
+      // Clear the local state first so the exception path does not call it a
+      // second time and corrupt torch_npu's allocator capture bookkeeping.
       capture_started = false;
+      graph_.capture_end();
     } catch (...) {
       if (capture_started) {
+        capture_started = false;
         try {
           graph_.capture_end();
         } catch (const std::exception& cleanup_error) {
@@ -426,8 +433,8 @@ bool AclGraph::capture(CausalLM* model,
         } catch (...) {
           LOG(ERROR) << "ACL graph capture_end during cleanup failed.";
         }
-        graph_.reset();
       }
+      graph_.reset();
       if (need_restore_stream) {
         c10_npu::setCurrentNPUStream(
             c10_npu::getDefaultNPUStream(tensor_options.device().index()));
@@ -451,7 +458,6 @@ bool AclGraph::capture(CausalLM* model,
   if (capture_static_graph_tasks) {
     capture_static_graph_task_signature(graph_params.value());
   }
-  make_current_stream_wait_for_graph(stream);
   return true;
 }
 
@@ -546,14 +552,6 @@ AclGraph::~AclGraph() {
   } else if (capture_stream_.has_value()) {
     aclrtSynchronizeStream(capture_stream_.value().stream());
   }
-  if (replay_done_event_ != nullptr) {
-    aclrtDestroyEvent(replay_done_event_);
-    replay_done_event_ = nullptr;
-  }
-  if (replay_input_ready_event_ != nullptr) {
-    aclrtDestroyEvent(replay_input_ready_event_);
-    replay_input_ready_event_ = nullptr;
-  }
 }
 
 void AclGraph::initialize_streams(c10::DeviceIndex device_index,
@@ -561,44 +559,10 @@ void AclGraph::initialize_streams(c10::DeviceIndex device_index,
   capture_stream_ = capture_stream;
   update_stream_ = c10_npu::getStreamFromPool(true, device_index);
   device_index_ = device_index;
-  CHECK_EQ(aclrtCreateEventWithFlag(&replay_input_ready_event_, ACL_EVENT_SYNC),
-           ACL_SUCCESS)
-      << "Failed to create ACL graph replay input-ready event";
-  CHECK_EQ(aclrtCreateEventWithFlag(&replay_done_event_, ACL_EVENT_SYNC),
-           ACL_SUCCESS)
-      << "Failed to create ACL graph replay completion event";
   VLOG(kGraphExecutorLogVerboseLevel)
       << "Initialized capture_stream"
       << ", id: " << capture_stream_.value().id()
       << ", device_index: " << static_cast<int32_t>(device_index);
-}
-
-void AclGraph::make_graph_wait_for_current_stream(aclrtStream current_stream) {
-  CHECK_NE(graph_stream_, nullptr) << "graph_stream is not initialized";
-  CHECK_NE(replay_input_ready_event_, nullptr)
-      << "replay_input_ready_event is not initialized";
-  if (current_stream == graph_stream_) {
-    return;
-  }
-  CHECK_EQ(aclrtRecordEvent(replay_input_ready_event_, current_stream),
-           ACL_SUCCESS)
-      << "aclrtRecordEvent(replay_input_ready_event) failed";
-  CHECK_EQ(aclrtStreamWaitEvent(graph_stream_, replay_input_ready_event_),
-           ACL_SUCCESS)
-      << "aclrtStreamWaitEvent(graph_stream, replay_input_ready_event) failed";
-}
-
-void AclGraph::make_current_stream_wait_for_graph(aclrtStream current_stream) {
-  CHECK_NE(graph_stream_, nullptr) << "graph_stream is not initialized";
-  CHECK_NE(replay_done_event_, nullptr)
-      << "replay_done_event is not initialized";
-  CHECK_EQ(aclrtRecordEvent(replay_done_event_, graph_stream_), ACL_SUCCESS)
-      << "aclrtRecordEvent(replay_done_event) failed";
-  if (current_stream != graph_stream_) {
-    CHECK_EQ(aclrtStreamWaitEvent(current_stream, replay_done_event_),
-             ACL_SUCCESS)
-        << "aclrtStreamWaitEvent(current_stream, replay_done_event) failed";
-  }
 }
 
 void AclGraph::prepare_model_graph_metadata(CausalLM* model,
@@ -668,7 +632,9 @@ ModelOutput AclGraph::replay(CausalLM* model,
       COUNTER_INC(num_model_execution_total_eager);
       return forward_eager(model, tokens, positions, kv_cache, params);
     }
-    // Raw TileLang launches require an explicit metadata refresh.
+    // Raw TileLang launches are not replayed as part of the captured ACL
+    // graph on this runtime. Refresh the persistent metadata and the
+    // graph-owned paged-attention tiling on the current stream before replay.
     persistent_param_.update_spec_verify_inputs(
         tokens,
         positions,
@@ -702,11 +668,9 @@ ModelOutput AclGraph::replay(CausalLM* model,
     }
   }
 
-  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-
-  if (graph_paged_attention_tiling_data_.defined()) {
-    make_graph_wait_for_current_stream(stream);
-  }
+  // NPUGraph launches its model on the current stream. The input refreshes
+  // above and all consumers of this output are therefore ordered naturally;
+  // do not record/wait an event on the unrelated capture stream.
   const bool use_static_graph_tasks =
       graph_params.has_value() &&
       static_graph_task_signature_matches(graph_params.value());
@@ -731,8 +695,6 @@ ModelOutput AclGraph::replay(CausalLM* model,
       update_graph_tasks(graph_params.value());
     }
   }
-  make_current_stream_wait_for_graph(stream);
-
   // Return the actual num_tokens portion of ModelOutput
   // Note: aux_hidden_states handling is done in AclGraphExecutorImpl::run()
   // since replay() doesn't have access to options
@@ -1071,7 +1033,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     // Handle aux_hidden_states based on options
     if (options_.enable_graph_aux_hidden_states()) {
       torch::Tensor aux_hidden_states =
-          active_persistent_param.aux_hidden_states(n_tokens);
+          replay_graph->get_aux_hidden_states(n_tokens);
       if (aux_hidden_states.defined() && aux_hidden_states.numel() > 0) {
         return ModelOutput(
             result.hidden_states, torch::Tensor(), aux_hidden_states);
@@ -1162,6 +1124,17 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     if (aux_hidden_states.defined() && aux_hidden_states.numel() > 0) {
       return ModelOutput(hidden_states, torch::Tensor(), aux_hidden_states);
     }
+
+    // Return the output from capture (no need to replay since capture
+    // already executed)
+    torch::Tensor hidden_states = graph->get_hidden_states(n_tokens);
+    if (options_.enable_graph_aux_hidden_states()) {
+      torch::Tensor aux_hidden_states = graph->get_aux_hidden_states(n_tokens);
+      if (aux_hidden_states.defined() && aux_hidden_states.numel() > 0) {
+        return ModelOutput(hidden_states, torch::Tensor(), aux_hidden_states);
+      }
+    }
+    return ModelOutput(hidden_states);
   }
   return ModelOutput(hidden_states);
 }
@@ -1305,7 +1278,7 @@ void AclGraph::print_graph_tensors() const {
       << "graph persistent_block_tables_: "
       << persistent_param_.persistent_block_tables();
   VLOG(kGraphExecutorLogVerboseLevel)
-      << "graph hidden_states_: " << persistent_param_.hidden_states();
+      << "graph hidden_states_: " << graph_hidden_states_;
 }
 
 // bucket will be [1, 2, 4, 8, 16, 32, 48, 64, ..., max_seqs_per_batch]

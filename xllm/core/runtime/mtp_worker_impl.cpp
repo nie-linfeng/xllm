@@ -22,9 +22,8 @@ limitations under the License.
 #endif
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
-#include <cstdint>
+#include <atomic>
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <string>
@@ -43,6 +42,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/sampling/logits_utils.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
@@ -485,14 +485,12 @@ bool is_qwen3_5_draft_model_type(const std::string& model_type) {
          mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
 }
 
-uint32_t validate_paired_transfer_counts(uint32_t target_transferred,
-                                         uint32_t draft_transferred) {
-  if (target_transferred != draft_transferred) {
-    LOG(ERROR) << "MTP target/draft KV block transfer count mismatch: target="
-               << target_transferred << ", draft=" << draft_transferred;
-    return 0;
-  }
-  return target_transferred;
+// The GLM-5-Next python MTP draft checkpoint carries its own embed_tokens /
+// lm_head copies (the exporter materializes them), so it needs no
+// target->draft weight sharing (the python CausalLM set_lm_head path is not
+// implemented for PyCausalLM).
+bool is_glm5_next_mtp_draft_model_type(const std::string& model_type) {
+  return model_type == "glm5_next_mtp";
 }
 
 }  // namespace
@@ -834,12 +832,15 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
         mtp_async::classify_combined_draft_execution_path(
             draft_impl_->context_.get_model_args().model_type());
     const bool draft_owns_shared_weights =
-        options_.enable_mtp_draft_body_tp1() &&
-        combined_draft_execution_path_ ==
-            mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
-    // Qwen3.5 draft checkpoints contain complete embedding and LMHead weights.
-    // Other MTP drafts retain their existing target-weight sharing contract;
-    // only their transformer body is replicated with TP1 parallel arguments.
+        (options_.enable_mtp_draft_body_tp1() &&
+         is_qwen3_5_draft_model_type(
+             draft_impl_->context_.get_model_args().model_type())) ||
+        is_glm5_next_mtp_draft_model_type(
+            draft_impl_->context_.get_model_args().model_type());
+    // Qwen3.5 and GLM-5-Next draft checkpoints contain complete embedding and
+    // LMHead weights. Other MTP drafts retain their existing target-weight
+    // sharing contract; only their transformer body is replicated with TP1
+    // parallel arguments.
     if (!draft_owns_shared_weights) {
       const bool python_weights_shared =
           draft_impl_->share_weights_from(*impl_);
@@ -1351,6 +1352,12 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
   prefill_input = input.to(device_, dtype_);
   prefill_input.sampling_params.return_probs = true;
   clear_ready_events(prefill_input);
+  // The draft model feeds on the target's hidden states (input_embedding set
+  // below), never on raw multimodal input: strip the copied mm_data so the
+  // draft executor does not drive vision encode on the text-only draft model
+  // (whose python object has no ``encode``) and skips the device copy of
+  // pixel_values it would never consume.
+  prefill_input.input_params.multimodal.mm_data = MMBatchData();
   auto& input_params = prefill_input.input_params;
   auto& extra_token_ids = input_params.embedding.extra_token_ids;
 
@@ -1383,6 +1390,7 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
 
 std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     const ForwardInput& raw_input) {
+  const auto step_t0 = std::chrono::steady_clock::now();
   ForwardInput input = raw_input;
   if (use_chunked_prefill_spec_verify_path()) {
     stabilize_decode_host_tensors(input);
@@ -1834,19 +1842,22 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   }
   const double draft_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
-              draft_latency_ms / 1000.0);
-
-  if (use_adaptive_speculative_decode) {
-    return run_adaptive_validate(
-        input, draft_outputs, validate_input, num_speculative_tokens);
+              timer.elapsed_seconds());
+  auto out = run_validate(input, draft_outputs, validate_input);
+  static std::atomic<int64_t> step_count{0};
+  static std::atomic<double> step_total_ms{0.0};
+  const double step_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - step_t0).count();
+  step_total_ms += step_ms;
+  const int64_t n = ++step_count;
+  if (n % 50 == 0) {
+    const char* env = std::getenv("GLM5_MTP_TIMING");
+    if (env != nullptr && std::string_view(env) == "1") {
+      LOG(INFO) << "[mtp-step] n=" << n << " last=" << step_ms << "ms "
+                << "avg=" << step_total_ms.load() / n << "ms";
+    }
   }
-
-  return run_validate(input,
-                      draft_outputs,
-                      validate_input,
-                      num_speculative_tokens,
-                      /*pruned_prefix_lengths=*/nullptr,
-                      has_json_object_states ? &json_scratch : nullptr);
+  return out;
 }
 
 void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
@@ -4039,25 +4050,54 @@ SampleOutput MTPWorkerImpl::validate(
     }
   }
 
-  if (pruned_prefix_lengths != nullptr) {
-    // Build cut/keep masks once from pruned_prefix_lengths and reuse across
-    // both helpers below, so we avoid re-uploading prefix_lengths and
-    // rebuilding identical arange+eq+logical_and masks per call.
-    const adaptive_pruning::PrunedPrefixMasks pruning_masks =
-        adaptive_pruning::build_pruned_prefix_masks(
-            *pruned_prefix_lengths,
-            num_speculative_tokens,
-            sample_output.next_tokens.device());
-    sync_pruned_boundary_outputs(sample_output,
-                                 target_output,
-                                 batch_size,
-                                 num_val_tokens,
-                                 pruning_masks);
-    apply_pruned_prefix_lengths(sample_output,
-                                target_output.sample_output.next_tokens,
-                                num_speculative_tokens,
-                                pruning_masks);
+  auto target_logits =
+      target_output.logits.view({batch_size, num_val_tokens, vocab_size});
+  if (!sampling_params.all_greedy_sample) {
+    // Mirror the regular sampler's logits processing on the verify logits:
+    // RejectionSampler::forward softmaxes RAW logits, so temperature/top-k/
+    // top-p silently vanished for every draft accept/resample decision (only
+    // the bonus token, sampled by the worker's regular sampler, kept the
+    // truncated distribution). With temperature=1 + top_k=10 the untruncated
+    // distribution lets long-tail tokens through and long generations drift
+    // into repetition loops. Flatten to [batch*num_val, vocab] and expand the
+    // per-seq params to token rows — apply_top_k_top_p broadcasts its param
+    // tensors against the logits' leading dims, which would misalign on the
+    // 3D view ([batch] vs [batch, num_val]).
+    auto flat_logits =
+        target_logits.view({batch_size * num_val_tokens, vocab_size});
+    auto rep = [&](const torch::Tensor& t) {
+      return t.defined()
+                 ? t.repeat_interleave(num_val_tokens).to(flat_logits.device())
+                 : t;
+    };
+    apply_top_k_top_p(flat_logits,
+                      rep(sampling_params.temperatures),
+                      rep(sampling_params.top_k),
+                      rep(sampling_params.top_p));
   }
+
+  // prepare input for rejection sampling
+  auto rejection_sampler =
+      std::make_unique<RejectionSampler>(sampling_params.do_sample,
+                                         sampling_params.all_random_sample,
+                                         sampling_params.all_greedy_sample,
+                                         target_output.logprobs,
+                                         target_output.max_top_logprobs,
+                                         enable_fused_kernel_);
+
+  // get the accepted tokens
+  SampleOutput sample_output = rejection_sampler->forward(
+      draft_token_ids.to(bonus_token_ids),
+      draft_probs.defined() ? draft_probs.to(target_logits.device())
+                            : torch::Tensor(),
+      target_logits,
+      bonus_token_ids,
+      /*mask_out_rejected_tokens=*/true);
+
+  // process embedding
+  auto embeddings = target_output.sample_output.embeddings;
+  sample_output.embeddings =
+      embeddings.view({batch_size, num_val_tokens, embeddings.size(-1)});
 
   return sample_output;
 }

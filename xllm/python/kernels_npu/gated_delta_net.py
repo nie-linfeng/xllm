@@ -41,23 +41,8 @@ def resolve_gdn_prefill_backend(
         The backend name to pass to :func:`chunk_gated_delta_rule`.
     """
     del capability
-    return "pytorch_naive"
-
-
-def fused_gdn_gating(
-    a_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute decay gate g and beta from raw projections via TileLang kernel."""
-    from .tilelang.fused_gdn_gating import fused_gdn_gating_kernel_jit
-
-    num_batches, num_heads = a.shape
-    kernel = fused_gdn_gating_kernel_jit(
-        num_batches=num_batches,
-        compile_max_batch=num_batches,
-        num_heads=num_heads,
+    raise NotImplementedError(
+        "resolve_gdn_prefill_backend has no NPU implementation; gated delta networks are not supported on NPU yet"
     )
 
     g_out = torch.empty(1, num_batches, num_heads, dtype=torch.float32, device=a.device)
@@ -212,19 +197,9 @@ def chunk_gated_delta_rule(
     Returns:
         The output with the shape of ``v`` and the final recurrent state.
     """
-    del backend
-    # npu_mega_chunk_gdn expects [B, T, H, D] layout with B=1 for packed input
-    # Cast g and beta to match C++ layer behavior (bf16 round-trip)
-    g_input = g.to(v.dtype)
-    beta_input = beta.to(v.dtype)
-    output, final_state = torch.ops.xllm_ops.chunk_gated_delta_rule(
-        q.unsqueeze(0),
-        k.unsqueeze(0),
-        v.unsqueeze(0),
-        g_input.unsqueeze(0),
-        beta_input.unsqueeze(0),
-        initial_state,
-        cu_seqlens,
+    del q, k, v, g, beta, initial_state, cu_seqlens, backend
+    raise NotImplementedError(
+        "chunk_gated_delta_rule has no NPU kernel; see kernels_cuda/triton/fla/ for the reference implementation"
     )
     return output.squeeze(0), final_state
 

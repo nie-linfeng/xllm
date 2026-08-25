@@ -33,7 +33,7 @@ limitations under the License.
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
-#include "core/runtime/decode_graph_bucket.h"
+#include "core/runtime/mtp_async_state.h"
 #include "core/util/utils.h"
 
 // ATB includes
@@ -290,9 +290,6 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
            "dtype: float32. This should not happen in production but for test.";
     dtype = torch::kFloat32;
   }
-  hidden_states_ = torch::zeros({max_tokens_per_batch, args.hidden_size()},
-                                torch::dtype(dtype).device(device));
-
   // Initialize persistent_mask_ only for model types that need to update an
   // explicit attention mask in graph mode. Unlike generic token buffers, the
   // mask is only consumed by decode / spec-verify graphs, so size it by graph
@@ -545,32 +542,6 @@ GraphPersistentParam::~GraphPersistentParam() {
   if (context_for_plan_ != nullptr) {
     atb::DestroyContext(context_for_plan_);
     context_for_plan_ = nullptr;
-  }
-}
-
-void GraphPersistentParam::set_aux_hidden_states(const torch::Tensor& value) {
-  if (!value.defined()) {
-    return;
-  }
-  const uint32_t result_tokens = value.size(0);
-  if (aux_hidden_states_.numel() == 0) {
-    const int64_t graph_token_capacity =
-        get_decode_graph_token_capacity(options_);
-    auto shape = value.sizes().vec();
-    shape[0] = graph_token_capacity;
-    torch::Dtype dtype = util::parse_dtype(args_.dtype(), device_);
-    if (args_.dtype() == "float" || args_.dtype() == "float32") {
-      dtype = torch::kFloat32;
-    }
-    aux_hidden_states_ =
-        torch::zeros(shape, torch::dtype(dtype).device(device_));
-  }
-  CHECK_LE(result_tokens, aux_hidden_states_.size(0))
-      << "aux hidden state output exceeds graph token capacity";
-  auto slice =
-      aux_hidden_states_.slice(/*dim=*/0, /*start=*/0, /*end=*/result_tokens);
-  if (slice.sizes() == value.sizes()) {
-    slice.copy_(value, /*non_blocking=*/true);
   }
 }
 
