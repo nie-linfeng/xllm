@@ -73,7 +73,9 @@ def vision_fusion_attention(
 
 def batch_matmul_transpose(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Project MLA values with the dedicated NPU transposed-BMM kernel."""
-    if x.device.type not in ("npu", "privateuseone") or _TRANSPOSE_BATCHMATMUL is None:
+    if x.device.type not in ("npu", "privateuseone"):
+        return torch.bmm(x, weight).transpose(0, 1)
+    if _TRANSPOSE_BATCHMATMUL is None:
         return torch.bmm(x, weight).transpose(0, 1)
     return _TRANSPOSE_BATCHMATMUL(x, weight, perm_y=(1, 0, 2))
 

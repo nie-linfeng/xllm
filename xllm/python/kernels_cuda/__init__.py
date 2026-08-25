@@ -14,19 +14,18 @@
 
 """CUDA kernels.
 
-``xllm.python.initialize_runtime()`` binds this package as
-``xllm.python.kernels`` when the active platform is CUDA, so layers and models
-import one fixed path and carry no hardware branch. Its peers -- ``kernels_npu``
-and any package added for new hardware -- are bound the same way on their own
-platform. Exactly one of them is imported in a process; they share no code and
-never import each other. ``setup.py`` ships only the package matching
-``--device``.
+``xllm/python/__init__.py`` binds this package as ``xllm.python.kernels`` when
+the active platform is CUDA, so layers and models import one fixed path and
+carry no hardware branch. Its peers -- ``kernels_npu`` and any package added for
+new hardware -- are bound the same way on their own platform. Exactly one of
+them is imported in a process; they share no code and never import each other.
+``setup.py`` ships only the package matching ``--device``.
 
-Launchers live under ``triton/`` and ``flashinfer/``; the modules here bind the
-public CUDA kernel API declared in ``__all__``. Peer packages own their APIs
-independently and need not export the same names. Existing unsupported stubs
-remain explicit CUDA failure paths, but they are not a cross-platform export
-contract.
+Launchers live under ``triton/`` and ``flashinfer/``; the modules here bind one
+kernel per name in ``__all__``. Peer packages export the same names, so a name
+without a CUDA kernel is still exported here, raising
+:class:`NotImplementedError` and carrying the signature an implementation has
+to meet.
 """
 
 from __future__ import annotations
@@ -49,7 +48,6 @@ from .gated_delta_net import (
     chunk_gated_delta_rule,
     fused_gdn_prefill_post_conv,
     fused_recurrent_gated_delta_rule_packed_decode,
-    gdn_prefill_prepare,
     resolve_gdn_prefill_backend,
 )
 from .linear import (
@@ -153,7 +151,6 @@ __all__ = [
     "causal_conv1d_prefill",
     "causal_conv1d_decode",
     "resolve_gdn_prefill_backend",
-    "gdn_prefill_prepare",
     "fused_gdn_prefill_post_conv",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "chunk_gated_delta_rule",

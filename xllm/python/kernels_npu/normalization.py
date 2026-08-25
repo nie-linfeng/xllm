@@ -63,11 +63,11 @@ def rms_norm_gated(
     weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Apply RMSNorm to ``value`` and gate the result with ``silu(gate)``.
+    """Apply RMSNorm to ``value`` and gate the result with ``gate``.
 
     Args:
         value: Tensor to normalize.
-        gate: Gate applied after normalization (SiLU is applied internally).
+        gate: Gate applied after normalization, same shape as ``value``.
         weight: RMSNorm weight over the last dimension.
         eps: RMSNorm epsilon.
 

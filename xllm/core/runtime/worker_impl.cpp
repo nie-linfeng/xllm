@@ -404,20 +404,10 @@ void disable_layerwise_split_for_draft(ParallelArgs* parallel_args) {
     split["rankIds"] =
         std::vector<uint32_t>{static_cast<uint32_t>(parallel_args->rank())};
   }
-#if defined(USE_NPU)
-  if (!parallel_args->mapping().Has(atb_speed::base::ATTN_LAYERWISE_SPLIT)) {
-    return;
-  }
-  atb_speed::common::ParallelInfo split_info =
-      parallel_args->mapping().Get(atb_speed::base::ATTN_LAYERWISE_SPLIT);
-  if (!split_info.IsEnabled()) {
-    return;
-  }
-  split_info.rank = 0;
-  split_info.rankIds = {static_cast<uint32_t>(parallel_args->rank())};
-  parallel_args->mapping().Register(atb_speed::base::ATTN_LAYERWISE_SPLIT,
-                                    split_info);
-#endif
+  // NOTE: the atb_speed::base::ATTN_LAYERWISE_SPLIT C++ mapping path is dropped
+  // on this GLM5-next branch (the pinned xllm_atb_layers submodule does not
+  // export that symbol). The JSON attnLayerwiseSplit mapping above is enough
+  // for the models served here.
 }
 
 }  // namespace

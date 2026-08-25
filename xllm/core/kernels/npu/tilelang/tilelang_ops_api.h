@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -61,17 +61,6 @@ void spec_verify_attention_tiling_update(
     int64_t block_size,
     int64_t max_kv_seq_len,
     int64_t kv_split_core_count);
-
-//
-// Return whether the packed allowed-token mask can use the TileLang fast path.
-bool can_apply_token_bitmask_inplace(const torch::Tensor& logits,
-                                     const torch::Tensor& bitmask);
-
-// Apply [rows, ceil(vocab / 32)] packed allowed-token words to logits in place.
-// Invalid inputs trigger CHECK failures; callers should use the predicate when
-// an ATen fallback is available.
-void apply_token_bitmask_inplace(torch::Tensor& logits,
-                                 const torch::Tensor& bitmask);
 
 // Apply TileLang RoPE kernel in-place on a single input tensor.
 // Invalid inputs trigger CHECK failures.
@@ -211,4 +200,18 @@ std::tuple<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule(
     float softplus_beta,
     float softplus_threshold);
 
+}  // namespace xllm::kernel::npu::tilelang
+
+namespace xllm::kernel::npu::tilelang {
+// Stub for the upstream apply_token_bitmask TileLang kernel, which this
+// GLM5-next branch does not ship. ``can_apply_token_bitmask_inplace`` returns
+// false so the caller (json_object_grammar sampling) falls back to its host
+// implementation; ``apply_token_bitmask_inplace`` is unreachable but kept
+// linkable.
+inline bool can_apply_token_bitmask_inplace(const torch::Tensor& /*logits*/,
+                                            const torch::Tensor& /*bitmask*/) {
+  return false;
+}
+inline void apply_token_bitmask_inplace(torch::Tensor& /*logits*/,
+                                        const torch::Tensor& /*bitmask*/) {}
 }  // namespace xllm::kernel::npu::tilelang

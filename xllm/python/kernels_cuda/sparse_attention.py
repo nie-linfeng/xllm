@@ -173,7 +173,6 @@ def quant_lightning_indexer_metadata(
     raise NotImplementedError(
         "quant_lightning_indexer_metadata has no CUDA kernel; sparse attention on CUDA is not supported yet"
     )
-    raise NotImplementedError("lightning_indexer_out has no CUDA kernel; sparse attention on CUDA is not supported yet")
 
 
 def scatter_nd_update(

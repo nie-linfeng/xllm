@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -42,7 +42,6 @@ limitations under the License.
 #pragma GCC diagnostic ignored "-Wattributes"
 #endif
 
-#include "acl_graph_bucket_policy.h"
 #include "torch_npu/csrc/core/npu/NPUGraph.h"
 
 #if defined(__GNUC__)
@@ -91,11 +90,11 @@ inline StaticGraphTaskSignature make_static_graph_task_signature(
 // NPUGraph provides mempool to manage temporary tensors during forward pass
 class AclGraph {
  public:
-  AclGraph(GraphPersistentParam& persistent_param,
-           c10::DeviceIndex device_index,
-           const c10_npu::NPUStream& capture_stream)
+  explicit AclGraph(GraphPersistentParam& persistent_param,
+                    c10::DeviceIndex device_index)
       : persistent_param_(persistent_param), device_index_(device_index) {
-    initialize_streams(device_index, capture_stream);
+    // Initialize capture stream in constructor
+    initialize_capture_stream(device_index);
   }
 
   ~AclGraph();
@@ -107,8 +106,7 @@ class AclGraph {
                const torch::Tensor& positions,
                const ModelInputParams& params,
                std::vector<KVCache>& kv_cache,
-               uint32_t bucket_num_tokens,
-               c10_npu::MempoolId_t graph_pool);
+               uint32_t bucket_num_tokens);
 
   // Replay captured graph with new input data
   ModelOutput replay(CausalLM* model,
@@ -146,9 +144,6 @@ class AclGraph {
     }
     return graph_aux_hidden_states_;
   }
-
-  c10_npu::MempoolId_t memory_pool() { return graph_.pool(); }
-  int64_t capture_stream_id() const { return capture_stream_->id(); }
 
  private:
   // Print graph held tensors for debugging
@@ -225,9 +220,6 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   [[nodiscard]] int32_t graph_slot_count_for_test() const {
     return graph_slot_count_;
   }
-  size_t get_graph_count() const;
-  size_t get_graph_memory_pool_count();
-  size_t get_graph_capture_stream_count() const;
 
  private:
   // not own
@@ -239,8 +231,6 @@ class AclGraphExecutorImpl : public ExecutorImpl {
 
   struct GraphSlot {
     std::unique_ptr<GraphPersistentParam> persistent_param;
-    c10_npu::MempoolId_t graph_pool{0, 0};
-    std::optional<c10_npu::NPUStream> graph_capture_stream;
     absl::flat_hash_map<uint64_t, std::shared_ptr<AclGraph>> graphs;
     std::deque<uint64_t> static_mtp_graph_keys;
     bool is_prepared = false;

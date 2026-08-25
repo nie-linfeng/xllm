@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -74,23 +74,6 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
 #endif
 }
 
-void ensure_xllm_runtime_module() {
-  py::module_ sys = py::module_::import("sys");
-  py::dict modules = py::reinterpret_borrow<py::dict>(sys.attr("modules"));
-  const py::str module_name("xllm_runtime");
-  if (modules.contains(module_name)) {
-    return;
-  }
-
-  py::object module_object =
-      py::module_::import("types").attr("ModuleType")(module_name);
-  py::module_ module = py::reinterpret_borrow<py::module_>(module_object);
-  register_xllm_runtime_module(module);
-  modules[module_name] = module;
-}
-
-}  // namespace
-
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                const ModelArgs& args,
                                const torch::Device& device,
@@ -103,7 +86,7 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   CHECK(py_causal_lm_ != nullptr) << "PyExecutorImpl requires PyCausalLM";
 
   py::gil_scoped_acquire gil;
-  ensure_xllm_runtime_module();
+  py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
   int32_t graph_max_seqs_per_batch = options_.max_seqs_per_batch();
